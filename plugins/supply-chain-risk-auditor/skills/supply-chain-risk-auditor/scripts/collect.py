@@ -888,7 +888,7 @@ def enrich_scorecard(http: sources.Http, dep: Dependency) -> None:
 def enrich_npm(http: sources.Http, dep: Dependency, token: str | None) -> None:
     """npm publishes the richest metadata of the three ecosystems."""
     try:
-        meta = sources.npm_metadata(http, dep.name)
+        meta = sources.npm_metadata(http, dep.name, dep.version)
     except sources.Unavailable as exc:
         reason = _reason(exc, "the npm registry")
         _fill(
@@ -898,25 +898,34 @@ def enrich_npm(http: sources.Http, dep: Dependency, token: str | None) -> None:
         )
         dep.signals["provenance"] = Signal.unassessable(reason)
     else:
-        dep.signals["deprecated"] = (
-            Signal.flagged(
-                f"deprecated by its maintainers: {meta['deprecated']}", meta["deprecated"]
+        # Current publishing authority remains distinct from the selected release.
+        dep.signals["publisher_concentration"] = _concentration_signal(
+            {**meta, "provenance": meta["publisher_provenance"]}
+        )
+        if meta["has_install_script"] is None:
+            reason = (
+                f"npm does not list selected release {dep.version}; release properties are unknown"
             )
-            if meta["deprecated"]
-            else Signal.clean("not deprecated", False)
-        )
-        dep.signals["publisher_concentration"] = _concentration_signal(meta)
-        dep.signals["install_script"] = (
-            Signal.flagged(
-                "runs an install script; `npm ci --ignore-scripts` prevents execution", True
+            _fill(dep, ("deprecated", "install_script", "provenance"), Signal.unassessable(reason))
+        else:
+            dep.signals["deprecated"] = (
+                Signal.flagged(
+                    f"deprecated by its maintainers: {meta['deprecated']}", meta["deprecated"]
+                )
+                if meta["deprecated"]
+                else Signal.clean("not deprecated", False)
             )
-            if meta["has_install_script"]
-            else Signal.clean("no install script", False)
-        )
-        dep.signals["provenance"] = Signal.clean(
-            "publishes with provenance" if meta["provenance"] else "no publish provenance",
-            meta["provenance"],
-        )
+            dep.signals["install_script"] = (
+                Signal.flagged(
+                    "runs an install script; `npm ci --ignore-scripts` prevents execution", True
+                )
+                if meta["has_install_script"]
+                else Signal.clean("no install script", False)
+            )
+            dep.signals["provenance"] = Signal.clean(
+                "publishes with provenance" if meta["provenance"] else "no publish provenance",
+                meta["provenance"],
+            )
     try:
         dep.signals["downloads"] = _download_signal(sources.npm_downloads(http, dep.name))
     except sources.Unavailable as exc:

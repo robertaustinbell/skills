@@ -340,8 +340,11 @@ def _maintainer_names(raw: object) -> list[str]:
     return names
 
 
-def npm_metadata(http: Http, name: str) -> dict:
-    """Current publish ACL, provenance, install-script flag, deprecation, repository.
+def npm_metadata(http: Http, name: str, version: str | None = None) -> dict:
+    """Current package ACL/repository and release-specific flags for version or latest.
+
+    A missing explicitly selected release leaves its properties unknown while
+    preserving current package-level metadata. Never substitute latest for a pin.
 
     Raises:
         NotFound: If the package is not published.
@@ -355,18 +358,23 @@ def npm_metadata(http: Http, name: str) -> dict:
     versions = doc.get("versions") or {}
     if not latest or latest not in versions:
         raise Unavailable("npm's latest tag points at a version absent from the packument")
-    version_doc = versions[latest]
+    version_doc = versions.get(version if version is not None else latest)
     maintainers = _maintainer_names(doc.get("maintainers"))
     repository = doc.get("repository")
     repo_url = repository.get("url") if isinstance(repository, dict) else repository
     return {
         "latest": latest,
+        "publisher_provenance": bool((versions[latest].get("dist") or {}).get("attestations")),
         "maintainers": maintainers,
         "human_maintainers": [m for m in maintainers if not looks_automated(m)],
         "automated_maintainers": [m for m in maintainers if looks_automated(m)],
-        "has_install_script": bool(version_doc.get("hasInstallScript")),
-        "provenance": bool((version_doc.get("dist") or {}).get("attestations")),
-        "deprecated": version_doc.get("deprecated") or doc.get("deprecated"),
+        "has_install_script": bool(version_doc.get("hasInstallScript"))
+        if version_doc is not None
+        else None,
+        "provenance": bool((version_doc.get("dist") or {}).get("attestations"))
+        if version_doc is not None
+        else None,
+        "deprecated": (version_doc.get("deprecated") or "") if version_doc is not None else None,
         "repository": normalize_repo(repo_url) if isinstance(repo_url, str) else None,
     }
 

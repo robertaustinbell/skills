@@ -605,6 +605,110 @@ def test_offline_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert artifact["transitive"]["examined"] is False
 
 
+@pytest.mark.parametrize(
+    ("selected", "old_risky", "latest_risky"),
+    [
+        pytest.param("1.0.0", True, False, id="locked-risky-latest-clean"),
+        pytest.param("1.0.0", False, True, id="locked-clean-latest-risky"),
+        pytest.param("2.0.0", False, True, id="selected-is-latest"),
+        pytest.param("0.5.0", False, True, id="selected-absent-no-latest-fallback"),
+    ],
+)
+def test_npm_release_signals_follow_locked_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    selected: str,
+    old_risky: bool,
+    latest_risky: bool,
+):
+    """Release facts belong to the lock, not the packument's current latest tag."""
+    from render import render
+
+    monkeypatch.setattr(sources, "gh_token", lambda: None)
+    monkeypatch.setattr(sources, "polite_pause", lambda: None)
+    name = "release-metadata-fixture"
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "package.json").write_text(json.dumps({"dependencies": {name: selected}}))
+    # registry_entry's integrity is a synthetic truthiness marker, not valid SRI;
+    # no tarball is downloaded or installed by this metadata-only fixture.
+    (project / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {"dependencies": {name: selected}},
+                    f"node_modules/{name}": registry_entry(name, selected),
+                },
+            }
+        )
+    )
+    versions = {
+        version: {
+            "name": name,
+            "version": version,
+            "hasInstallScript": risky,
+            "deprecated": f"retired release {version}" if risky else "",
+            "dist": {
+                "attestations": {"url": f"{REG}/-/npm/v1/attestations/{name}@{version}"}
+                if risky
+                else {}
+            },
+        }
+        for version, risky in (("1.0.0", old_risky), ("2.0.0", latest_risky))
+    }
+    seeded_http(
+        tmp_path / "cache",
+        {
+            ("GET", f"{REG}/{name}", ""): {
+                "name": name,
+                "dist-tags": {"latest": "2.0.0"},
+                "versions": versions,
+                "maintainers": [{"name": "alice"}, {"name": "bob"}],
+            },
+            ("GET", f"https://api.npmjs.org/downloads/point/last-week/{name}", ""): {
+                "downloads": 5000
+            },
+            ("POST", OSV, osv_body([("npm", name, selected)])): {"results": [{}]},
+        },
+    )
+    artifact = collect(project, tmp_path / "cache", offline=True)
+    report = render(artifact)
+    assert len(artifact["dependencies"]) == 1
+    dep = artifact["dependencies"][0]
+    assert dep["version"] == selected and dep["version_source"] == "lockfile"
+    # Publisher authority uses the current publishing path, not the historical pin.
+    assert dep["signals"]["publisher_concentration"]["state"] == (
+        State.UNASSESSABLE.value if latest_risky else State.CLEAN.value
+    )
+    assert dep["signals"]["downloads"]["state"] == State.CLEAN.value
+    release_signals = ("deprecated", "install_script", "provenance")
+    if selected not in versions:
+        assert {key: dep["signals"][key]["state"] for key in release_signals} == {
+            key: State.UNASSESSABLE.value for key in release_signals
+        }
+        assert "retired release 2.0.0" not in report
+        assert "runs an install script" not in report
+        return
+
+    risky = old_risky if selected == "1.0.0" else latest_risky
+    risk_state = State.FLAGGED.value if risky else State.CLEAN.value
+    assert {
+        key: (dep["signals"][key]["state"], dep["signals"][key]["value"]) for key in release_signals
+    } == {
+        "deprecated": (risk_state, f"retired release {selected}" if risky else False),
+        "install_script": (risk_state, risky),
+        # Provenance is informational even when absent; do not turn it into a risk flag.
+        "provenance": (State.CLEAN.value, risky),
+    }
+    assert (f"retired release {selected}" in report) is risky
+    assert ("runs an install script" in report) is risky
+    if selected != "2.0.0":
+        assert "retired release 2.0.0" not in report
+    if risky:
+        assert f"| `{name}` | {selected} | 5,000/wk |" in report
+
+
 def test_every_source_unavailable_refuses_to_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
